@@ -1,1 +1,1 @@
-{"name":"suwappu-mcp-advisor","version":"1.0.0","type":"module","scripts":{"start":"npx tsx advisor.ts"},"dependencies":{"tsx":"^4.0.0"},"license":"MIT"}
+{"name":"suwappu-mcp-advisor","version":"1.0.0","type":"module","bin":{"suwappu-advisor":"src/advisor.ts"},"scripts":{"start":"bun run src/advisor.ts","check":"tsc --noEmit","test":"bun test"},"dependencies":{"tsx":"^4.0.0"},"devDependencies":{"typescript":"^5.0.0"},"engines":{"node":">=18"},"license":"MIT"}
