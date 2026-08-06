@@ -49,6 +49,39 @@ function defaultMcpUrl(): string {
   return `${apiUrl}/mcp`;
 }
 
+function decodeJsonRpcEnvelope<T>(
+  text: string,
+  contentType: string,
+): JsonRpcEnvelope<T> {
+  const candidates: string[] = [];
+
+  if (contentType.includes("text/event-stream")) {
+    for (const block of text.split(/\r?\n\r?\n/)) {
+      const data = block
+        .split(/\r?\n/)
+        .filter((line) => line.startsWith("data:"))
+        .map((line) => line.slice(5).trimStart())
+        .join("\n");
+      if (data && data !== "[DONE]") candidates.push(data);
+    }
+  } else if (text) {
+    candidates.push(text);
+  }
+
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate) as unknown;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return parsed as JsonRpcEnvelope<T>;
+      }
+    } catch {
+      // Try the next SSE event before failing the response.
+    }
+  }
+
+  throw new Error("Suwappu MCP returned no decodable JSON-RPC message");
+}
+
 export function initializeParams() {
   return {
     protocolVersion: MCP_PROTOCOL_VERSION,
@@ -86,6 +119,8 @@ export function parseToolResult(result: ToolCallResult): unknown {
 
 export class McpClient {
   private requestId = 0;
+  private sessionId = "";
+  private negotiatedProtocol = "";
   readonly url: string;
 
   constructor(
@@ -100,7 +135,16 @@ export class McpClient {
       "Content-Type": "application/json",
       Accept: "application/json, text/event-stream",
       ...(this.apiKey ? { Authorization: `Bearer ${this.apiKey}` } : {}),
+      ...(this.sessionId ? { "Mcp-Session-Id": this.sessionId } : {}),
+      ...(this.negotiatedProtocol
+        ? { "MCP-Protocol-Version": this.negotiatedProtocol }
+        : {}),
     };
+  }
+
+  private rememberSession(response: Response): void {
+    const sessionId = response.headers.get("Mcp-Session-Id");
+    if (sessionId) this.sessionId = sessionId;
   }
 
   private async request<T>(
@@ -118,28 +162,37 @@ export class McpClient {
         params,
       }),
     });
+    this.rememberSession(response);
 
     const text = await response.text();
-    let envelope: JsonRpcEnvelope<T> | undefined;
-    if (text) {
-      try {
-        envelope = JSON.parse(text) as JsonRpcEnvelope<T>;
-      } catch {
-        throw new Error(
-          `Suwappu MCP returned non-JSON HTTP ${response.status}: ${text.slice(0, 200)}`,
-        );
-      }
-    }
-
-    if (envelope?.error) {
+    if (!response.ok) {
       throw new Error(
-        `MCP error ${envelope.error.code ?? "unknown"}: ${envelope.error.message ?? "unknown error"}`,
+        `Suwappu MCP HTTP ${response.status}: ${text || response.statusText}`,
       );
     }
-    if (!response.ok) {
-      throw new Error(`Suwappu MCP HTTP ${response.status}: ${text || response.statusText}`);
+
+    let envelope: JsonRpcEnvelope<T>;
+    try {
+      envelope = decodeJsonRpcEnvelope<T>(
+        text,
+        response.headers.get("content-type") ?? "",
+      );
+    } catch (error) {
+      throw new Error(
+        `MCP method ${method} returned an invalid response: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
     }
-    if (!envelope || envelope.result === undefined) {
+
+    if (envelope.error) {
+      throw new Error(
+        `MCP error ${envelope.error.code ?? "unknown"}: ${
+          envelope.error.message ?? "unknown error"
+        }`,
+      );
+    }
+    if (envelope.result === undefined) {
       throw new Error(`MCP method ${method} returned no result`);
     }
 
@@ -159,6 +212,8 @@ export class McpClient {
         params,
       }),
     });
+    this.rememberSession(response);
+
     if (!response.ok) {
       throw new Error(`MCP notification ${method} failed with HTTP ${response.status}`);
     }
@@ -175,6 +230,7 @@ export class McpClient {
       serverInfo: { name: string; version: string };
     }>("initialize", initializeParams());
 
+    this.negotiatedProtocol = result.protocolVersion || MCP_PROTOCOL_VERSION;
     await this.notify("notifications/initialized");
     return result;
   }
