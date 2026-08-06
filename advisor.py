@@ -1,342 +1,654 @@
 #!/usr/bin/env python3
-"""
-Suwappu MCP Portfolio Advisor — Python
-Custom MCP client that discovers tools, fetches data, and generates investment advice.
+"""Suwappu hosted-MCP portfolio advisor example.
+
+The advisory path is intentionally non-transactional. It can optionally request
+read-only quotes with --quotes, but it never calls execute_swap and never calls
+the managed REST execution endpoint.
 """
 
-import os
-import sys
+from __future__ import annotations
+
+import argparse
 import json
+import os
+import re
+from typing import Any
+
 import requests
 
-MCP_URL = "https://api.suwappu.bot/mcp"
+MCP_PROTOCOL_VERSION = "2025-06-18"
+DEFAULT_MCP_URL = "https://api.suwappu.bot/mcp"
+REQUEST_TIMEOUT_SECONDS = 30
+ADVISOR_TOOL_ALLOWLIST = {
+    "get_portfolio",
+    "get_prices",
+    "list_chains",
+    "get_quote",
+}
+
+
+def _decode_jsonrpc_response(response: requests.Response) -> dict[str, Any]:
+    """Decode either JSON or the single-message SSE form allowed by MCP HTTP."""
+    content_type = response.headers.get("content-type", "")
+    if "text/event-stream" not in content_type:
+        data = response.json()
+        if not isinstance(data, dict):
+            raise RuntimeError("MCP returned a non-object JSON-RPC response")
+        return data
+
+    for block in re.split(r"\r?\n\r?\n", response.text):
+        data_lines = [
+            line[5:].lstrip()
+            for line in block.splitlines()
+            if line.startswith("data:")
+        ]
+        if not data_lines:
+            continue
+        payload = "\n".join(data_lines)
+        if payload == "[DONE]":
+            continue
+        data = json.loads(payload)
+        if isinstance(data, dict):
+            return data
+
+    raise RuntimeError("MCP returned an SSE response without a JSON-RPC message")
 
 
 class McpClient:
-    """Minimal MCP client wrapping the Suwappu MCP HTTP endpoint."""
+    """Small Streamable HTTP client for Suwappu's hosted MCP endpoint."""
 
-    def __init__(self, api_key):
+    def __init__(self, api_key: str = "", url: str | None = None):
         self.api_key = api_key
-        self.headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        }
+        self.url = url or os.environ.get("SUWAPPU_MCP_URL", DEFAULT_MCP_URL)
         self.request_id = 0
-        self.tools = []
+        self.session_id: str | None = None
+        self.negotiated_protocol: str | None = None
 
-    def _next_id(self):
+    def _headers(self) -> dict[str, str]:
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+        }
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        if self.session_id:
+            headers["Mcp-Session-Id"] = self.session_id
+        if self.negotiated_protocol:
+            headers["MCP-Protocol-Version"] = self.negotiated_protocol
+        return headers
+
+    def _post(self, payload: dict[str, Any]) -> requests.Response:
+        response = requests.post(
+            self.url,
+            headers=self._headers(),
+            json=payload,
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        session_id = response.headers.get("Mcp-Session-Id")
+        if session_id:
+            self.session_id = session_id
+        return response
+
+    def _next_id(self) -> int:
         self.request_id += 1
         return self.request_id
 
-    def _send(self, method, params=None):
-        """Send a JSON-RPC 2.0 request to the MCP endpoint."""
-        payload = {
-            "jsonrpc": "2.0",
-            "id": self._next_id(),
-            "method": method,
-            "params": params or {},
-        }
-        response = requests.post(MCP_URL, headers=self.headers, json=payload)
-        response.raise_for_status()
-        data = response.json()
-
+    def _send(
+        self,
+        method: str,
+        params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        response = self._post(
+            {
+                "jsonrpc": "2.0",
+                "id": self._next_id(),
+                "method": method,
+                "params": params or {},
+            }
+        )
+        data = _decode_jsonrpc_response(response)
         if "error" in data:
-            raise Exception(f"MCP error {data['error']['code']}: {data['error']['message']}")
-
-        return data["result"]
-
-    def initialize(self):
-        """Perform the MCP handshake."""
-        result = self._send("initialize")
-        server = result["serverInfo"]
-        print(f"Connected to {server['name']} v{server['version']}")
-        print(f"Protocol: {result['protocolVersion']}")
+            error = data["error"]
+            raise RuntimeError(
+                f"MCP error {error.get('code', 'unknown')}: "
+                f"{error.get('message', 'unknown error')}"
+            )
+        result = data.get("result")
+        if not isinstance(result, dict):
+            raise RuntimeError(f"MCP method {method} returned no object result")
         return result
 
-    def list_tools(self):
-        """Discover available tools and their schemas."""
-        result = self._send("tools/list")
-        self.tools = result.get("tools", [])
-        return self.tools
+    def _notify(
+        self,
+        method: str,
+        params: dict[str, Any] | None = None,
+    ) -> None:
+        self._post(
+            {
+                "jsonrpc": "2.0",
+                "method": method,
+                "params": params or {},
+            }
+        )
 
-    def call_tool(self, name, arguments=None):
-        """Call a tool by name and return parsed result."""
-        result = self._send("tools/call", {
-            "name": name,
-            "arguments": arguments or {},
-        })
-        # MCP returns content as array of parts with JSON strings
+    def initialize(self) -> dict[str, Any]:
+        result = self._send(
+            "initialize",
+            {
+                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "suwappu-mcp-advisor-python",
+                    "version": "1.1.0",
+                },
+            },
+        )
+        self.negotiated_protocol = str(
+            result.get("protocolVersion", MCP_PROTOCOL_VERSION)
+        )
+        self._notify("notifications/initialized")
+        return result
+
+    def list_tools(self) -> list[dict[str, Any]]:
+        result = self._send("tools/list")
+        tools = result.get("tools", [])
+        return tools if isinstance(tools, list) else []
+
+    def list_resources(self) -> list[dict[str, Any]]:
+        result = self._send("resources/list")
+        resources = result.get("resources", [])
+        return resources if isinstance(resources, list) else []
+
+    def list_prompts(self) -> list[dict[str, Any]]:
+        result = self._send("prompts/list")
+        prompts = result.get("prompts", [])
+        return prompts if isinstance(prompts, list) else []
+
+    def call_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any] | None = None,
+    ) -> Any:
+        result = self._send(
+            "tools/call",
+            {"name": name, "arguments": arguments or {}},
+        )
         content = result.get("content", [])
-        for part in content:
-            if part["type"] == "text":
-                try:
-                    return json.loads(part["text"])
-                except json.JSONDecodeError:
-                    return part["text"]
+        text = next(
+            (
+                part.get("text")
+                for part in content
+                if isinstance(part, dict)
+                and part.get("type") == "text"
+                and isinstance(part.get("text"), str)
+            ),
+            None,
+        )
+
+        if result.get("isError"):
+            raise RuntimeError(text or "Suwappu MCP tool returned an error")
+
+        if "structuredContent" in result:
+            return result["structuredContent"]
+
+        if text is not None:
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                return text
+
         return content
 
 
-def analyze_with_ai(portfolio_data, price_data, chains_data):
-    """Use OpenAI or Anthropic to analyze the portfolio. Falls back to rules."""
-    openai_key = os.environ.get("OPENAI_API_KEY")
-    anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
-
-    prompt = f"""You are a crypto portfolio advisor. Analyze this portfolio and provide actionable recommendations.
-
-Portfolio Holdings:
-{json.dumps(portfolio_data, indent=2)}
-
-Current Prices (with 24h change):
-{json.dumps(price_data, indent=2)}
-
-Supported Chains:
-{json.dumps(chains_data, indent=2)}
-
-Analyze for:
-1. Concentration risk (any single token >50% of portfolio?)
-2. Momentum signals (tokens with >5% 24h change)
-3. Diversification score (how many tokens, how spread across chains)
-4. Stablecoin ratio (is there enough stable allocation for risk management?)
-
-Provide 2-3 specific trade recommendations with reasoning. Format as a clear report."""
-
-    if openai_key:
-        return _call_openai(openai_key, prompt)
-    elif anthropic_key:
-        return _call_anthropic(anthropic_key, prompt)
-    else:
-        return None
+def assert_advisor_tool_allowed(name: str) -> None:
+    if name not in ADVISOR_TOOL_ALLOWLIST:
+        raise RuntimeError(
+            f'Tool "{name}" is outside the advisor local allowlist. '
+            "This example never calls transaction-preparation or execution tools."
+        )
 
 
-def _call_openai(api_key, prompt):
-    """Call OpenAI API for analysis."""
-    response = requests.post(
-        "https://api.openai.com/v1/chat/completions",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": "gpt-4o",
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.3,
-        },
-    )
-    response.raise_for_status()
-    return response.json()["choices"][0]["message"]["content"]
+def call_advisor_tool(
+    client: McpClient,
+    name: str,
+    arguments: dict[str, Any] | None = None,
+) -> Any:
+    assert_advisor_tool_allowed(name)
+    return client.call_tool(name, arguments)
 
 
-def _call_anthropic(api_key, prompt):
-    """Call Anthropic API for analysis."""
-    response = requests.post(
-        "https://api.anthropic.com/v1/messages",
-        headers={
-            "x-api-key": api_key,
-            "anthropic-version": "2023-06-01",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": "claude-sonnet-4-20250514",
-            "max_tokens": 1024,
-            "messages": [{"role": "user", "content": prompt}],
-        },
-    )
-    response.raise_for_status()
-    return response.json()["content"][0]["text"]
+def parse_portfolio(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise RuntimeError("Malformed get_portfolio result from MCP")
+
+    raw_balances = value.get("balances", [])
+    if not isinstance(raw_balances, list):
+        raw_balances = []
+
+    balances: list[dict[str, Any]] = []
+    for raw in raw_balances:
+        if not isinstance(raw, dict):
+            continue
+        usd_value = float(raw.get("usd_value", raw.get("usdValue", 0)))
+        if usd_value < 0:
+            raise RuntimeError("Portfolio contains an invalid usd_value")
+        balances.append(
+            {
+                "symbol": str(raw.get("symbol", raw.get("token", ""))),
+                "chain": str(raw.get("chain", "")),
+                "balance": str(raw.get("balance", "0")),
+                "usd_value": usd_value,
+            }
+        )
+
+    reported_total = value.get("total_usd", value.get("totalUsd"))
+    try:
+        total_usd = float(reported_total)
+    except (TypeError, ValueError):
+        total_usd = sum(balance["usd_value"] for balance in balances)
+
+    return {"balances": balances, "total_usd": total_usd}
 
 
-def rule_based_analysis(portfolio_data, price_data):
-    """Simple rule-based analysis when no AI key is available."""
-    balances = portfolio_data.get("balances", [])
-    total_usd = portfolio_data.get("total_usd", 0)
-    recommendations = []
+def parse_prices(value: Any) -> dict[str, dict[str, float | None]]:
+    if not isinstance(value, dict):
+        raise RuntimeError("Malformed get_prices result from MCP")
+    source = value.get("prices", value)
+    if not isinstance(source, dict):
+        return {}
 
-    if total_usd == 0:
-        return "Portfolio is empty. Fund your wallet to get started."
+    prices: dict[str, dict[str, float | None]] = {}
+    for symbol, raw in source.items():
+        if not isinstance(raw, dict):
+            continue
+        usd_raw = raw.get("usd", raw.get("priceUsd", raw.get("price_usd")))
+        try:
+            usd = float(usd_raw)
+        except (TypeError, ValueError):
+            continue
+        if usd <= 0:
+            continue
 
-    report = []
-    report.append("=" * 55)
-    report.append("  PORTFOLIO ADVISORY REPORT")
-    report.append("=" * 55)
+        change_raw = raw.get("change_24h", raw.get("change24h"))
+        try:
+            change = None if change_raw is None else float(change_raw)
+        except (TypeError, ValueError):
+            change = None
 
-    # 1. Concentration risk
-    report.append("\n  1. CONCENTRATION RISK")
-    for bal in balances:
-        pct = (bal["usd_value"] / total_usd) * 100 if total_usd > 0 else 0
+        prices[str(symbol).upper()] = {"usd": usd, "change_24h": change}
+    return prices
+
+
+def rule_based_analysis(
+    portfolio: dict[str, Any],
+    prices: dict[str, dict[str, float | None]],
+) -> tuple[str, list[dict[str, str]]]:
+    balances = portfolio.get("balances", [])
+    total_usd = float(portfolio.get("total_usd", 0) or 0)
+    recommendations: list[dict[str, str]] = []
+
+    if total_usd <= 0:
+        return "Portfolio has no positive USD valuation to analyze.", recommendations
+
+    lines = [
+        "=" * 55,
+        "  PORTFOLIO ADVISORY REPORT",
+        "=" * 55,
+        "\n  1. CONCENTRATION RISK",
+    ]
+    for balance in balances:
+        pct = (float(balance["usd_value"]) / total_usd) * 100
         if pct > 50:
-            report.append(f"     WARNING: {bal['symbol']} is {pct:.1f}% of portfolio (>50%)")
-            recommendations.append({
-                "action": "sell",
-                "token": bal["symbol"],
-                "reason": f"Over-concentrated at {pct:.1f}%",
-                "target": "Reduce to <40% by selling into USDC or diversifying",
-            })
+            lines.append(
+                f"     WARNING: {balance['symbol']} is {pct:.1f}% of portfolio (>50%)"
+            )
+            recommendations.append(
+                {
+                    "action": "sell",
+                    "token": str(balance["symbol"]),
+                    "reason": f"Over-concentrated at {pct:.1f}%; research signal only",
+                }
+            )
         elif pct > 30:
-            report.append(f"     WATCH: {bal['symbol']} at {pct:.1f}% — approaching concentration limit")
+            lines.append(
+                f"     WATCH: {balance['symbol']} at {pct:.1f}% — review concentration"
+            )
         else:
-            report.append(f"     OK: {bal['symbol']} at {pct:.1f}%")
+            lines.append(f"     OK: {balance['symbol']} at {pct:.1f}%")
 
-    # 2. Momentum signals
-    report.append("\n  2. MOMENTUM SIGNALS (24h)")
-    for symbol, data in price_data.items():
-        change = data.get("change_24h", 0)
+    lines.append("\n  2. MOMENTUM SIGNALS (24h)")
+    for symbol, data in prices.items():
+        change = float(data.get("change_24h") or 0)
         if change > 5:
-            report.append(f"     BULLISH: {symbol} +{change:.1f}% — consider taking profits")
+            lines.append(
+                f"     UP: {symbol} +{change:.1f}% — review concentration/risk"
+            )
         elif change < -5:
-            report.append(f"     BEARISH: {symbol} {change:.1f}% — potential buying opportunity")
-            # Check if we already hold it
-            held = any(b["symbol"] == symbol for b in balances)
-            if not held:
-                recommendations.append({
-                    "action": "buy",
-                    "token": symbol,
-                    "reason": f"Down {change:.1f}% — potential dip buy",
-                })
+            lines.append(f"     DOWN: {symbol} {change:.1f}% — research before acting")
         else:
-            report.append(f"     NEUTRAL: {symbol} {change:+.1f}%")
+            lines.append(f"     FLAT: {symbol} {change:+.1f}%")
 
-    # 3. Diversification
-    report.append("\n  3. DIVERSIFICATION")
-    num_tokens = len(balances)
-    chains = set(b["chain"] for b in balances)
-    score = min(10, num_tokens * 2 + len(chains))
-    report.append(f"     Tokens held: {num_tokens}")
-    report.append(f"     Chains used: {len(chains)} ({', '.join(chains)})")
-    report.append(f"     Score: {score}/10")
-    if num_tokens < 3:
-        report.append("     TIP: Consider diversifying into at least 3-5 tokens")
+    chains = {str(balance["chain"]) for balance in balances if balance.get("chain")}
+    score = min(10, len(balances) * 2 + len(chains))
+    lines.extend(
+        [
+            "\n  3. DIVERSIFICATION",
+            f"     Tokens held: {len(balances)}",
+            f"     Chains used: {len(chains)} ({', '.join(sorted(chains))})",
+            f"     Heuristic score: {score}/10",
+        ]
+    )
 
-    # 4. Stablecoin ratio
-    report.append("\n  4. STABLECOIN RATIO")
     stable_symbols = {"USDC", "USDT", "DAI"}
-    stable_usd = sum(b["usd_value"] for b in balances if b["symbol"] in stable_symbols)
-    stable_pct = (stable_usd / total_usd) * 100 if total_usd > 0 else 0
-    report.append(f"     Stablecoins: ${stable_usd:,.2f} ({stable_pct:.1f}%)")
+    stable_usd = sum(
+        float(balance["usd_value"])
+        for balance in balances
+        if str(balance["symbol"]).upper() in stable_symbols
+    )
+    stable_pct = (stable_usd / total_usd) * 100
+    lines.extend(
+        [
+            "\n  4. STABLECOIN RATIO",
+            f"     Stablecoins: ${stable_usd:,.2f} ({stable_pct:.1f}%)",
+        ]
+    )
     if stable_pct < 10:
-        report.append("     WARNING: Low stablecoin allocation (<10%). Consider increasing for risk management.")
-        recommendations.append({
-            "action": "rebalance",
-            "token": "USDC",
-            "reason": "Stablecoin allocation too low for risk management",
-        })
+        lines.append(
+            "     FLAG: Stablecoin allocation is below this example's 10% heuristic."
+        )
+        recommendations.append(
+            {
+                "action": "rebalance",
+                "token": "USDC",
+                "reason": "Stablecoin allocation below the example's 10% heuristic",
+            }
+        )
     elif stable_pct > 60:
-        report.append("     NOTE: High stablecoin ratio (>60%). Capital may be underdeployed.")
+        lines.append(
+            "     FLAG: Stablecoin allocation is above this example's 60% heuristic."
+        )
 
-    # 5. Recommendations
-    report.append("\n  5. RECOMMENDATIONS")
+    lines.append("\n  5. RESEARCH FLAGS")
     if recommendations:
-        for i, rec in enumerate(recommendations, 1):
-            report.append(f"     {i}. {rec['action'].upper()} {rec['token']}: {rec['reason']}")
-            if "target" in rec:
-                report.append(f"        → {rec['target']}")
+        for index, recommendation in enumerate(recommendations, 1):
+            lines.append(
+                f"     {index}. {recommendation['action'].upper()} "
+                f"{recommendation['token']}: {recommendation['reason']}"
+            )
     else:
-        report.append("     No immediate action needed. Portfolio looks balanced.")
+        lines.append("     No heuristic flags triggered.")
 
-    report.append("")
-    return "\n".join(report), recommendations
+    return "\n".join(lines), recommendations
 
 
-def main():
-    api_key = os.environ.get("SUWAPPU_API_KEY")
-    if not api_key:
-        print("Error: Set SUWAPPU_API_KEY environment variable.")
-        print("  export SUWAPPU_API_KEY=suwappu_sk_your_api_key")
-        sys.exit(1)
+def analyze_with_ai(
+    portfolio: dict[str, Any],
+    prices: dict[str, Any],
+    chains: Any,
+) -> str | None:
+    prompt = f"""Analyze this crypto portfolio as a research exercise. Do not imply
+that any trade has been approved or executed.
 
-    wallet_address = os.environ.get("WALLET_ADDRESS")
-    if not wallet_address:
-        print("Error: Set WALLET_ADDRESS environment variable.")
-        print("  export WALLET_ADDRESS=0xYourWalletAddress")
-        sys.exit(1)
+Portfolio:
+{json.dumps(portfolio, indent=2)}
 
-    # Step 1: Initialize MCP client
-    print("Connecting to Suwappu MCP...")
-    client = McpClient(api_key)
-    client.initialize()
+Prices:
+{json.dumps(prices, indent=2)}
 
-    # Step 2: Discover tools
-    print("\nDiscovering tools...")
+Supported chains:
+{json.dumps(chains, indent=2)}
+
+Discuss concentration, 24h moves, diversification, and stablecoin exposure.
+Clearly label assumptions and research flags."""
+
+    openai_key = os.environ.get("OPENAI_API_KEY")
+    openai_model = os.environ.get("OPENAI_MODEL")
+    if openai_key and openai_model:
+        response = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {openai_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": openai_model,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.3,
+            },
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        return response.json()["choices"][0]["message"]["content"]
+
+    anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
+    anthropic_model = os.environ.get("ANTHROPIC_MODEL")
+    if anthropic_key and anthropic_model:
+        response = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": anthropic_key,
+                "anthropic-version": "2023-06-01",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": anthropic_model,
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        return response.json()["content"][0]["text"]
+
+    return None
+
+
+def verify_required_tools(tools: list[dict[str, Any]]) -> None:
+    discovered = {
+        str(tool.get("name"))
+        for tool in tools
+        if isinstance(tool, dict) and tool.get("name")
+    }
+    missing = ADVISOR_TOOL_ALLOWLIST - discovered
+    if missing:
+        raise RuntimeError(
+            "Hosted MCP server is missing expected tools: " + ", ".join(sorted(missing))
+        )
+
+
+def render_catalog(client: McpClient) -> None:
+    initialized = client.initialize()
     tools = client.list_tools()
-    print(f"Found {len(tools)} tools:")
+    resources = client.list_resources()
+    prompts = client.list_prompts()
+    server = initialized.get("serverInfo", {})
+
+    print(
+        f"Connected to {server.get('name', 'unknown')} "
+        f"v{server.get('version', 'unknown')} "
+        f"(MCP {initialized.get('protocolVersion', 'unknown')})"
+    )
+    print(f"\nTools ({len(tools)}):")
     for tool in tools:
-        desc = tool.get("description", "No description")
-        print(f"  - {tool['name']}: {desc}")
+        annotations = tool.get("annotations", {}) if isinstance(tool, dict) else {}
+        name = str(tool.get("name", "unknown"))
+        if annotations.get("readOnlyHint") is True:
+            hint = "read-only hint"
+        elif name == "execute_swap":
+            hint = "unsigned transaction preparation"
+        else:
+            hint = "inspect semantics"
+        print(f"  - {name} [{hint}]")
 
-    # Step 3: Fetch portfolio
-    print(f"\nFetching portfolio for {wallet_address[:10]}...{wallet_address[-6:]}...")
-    portfolio = client.call_tool("get_portfolio", {
-        "wallet_address": wallet_address,
-    })
+    print(f"\nResources ({len(resources)}):")
+    for resource in resources:
+        print(f"  - {resource.get('uri', 'unknown')}")
 
-    if not portfolio.get("balances"):
-        print("Portfolio is empty. Fund your wallet first.")
-        sys.exit(0)
+    print(f"\nPrompts ({len(prompts)}):")
+    for prompt in prompts:
+        print(f"  - {prompt.get('name', 'unknown')}")
 
-    # Print holdings
+    print(
+        "\nMCP annotations are descriptive hints, not authorization. "
+        "Clients still need a local capability policy."
+    )
+
+
+def show_illustrative_quotes(
+    client: McpClient,
+    portfolio: dict[str, Any],
+    recommendations: list[dict[str, str]],
+) -> None:
+    print(
+        "\nIllustrative quotes (--quotes): get_quote is read-only; "
+        "no transaction is prepared, signed, or broadcast."
+    )
+    balances = portfolio["balances"]
+
+    for recommendation in recommendations:
+        if recommendation["action"] != "sell":
+            continue
+        holding = next(
+            (
+                balance
+                for balance in balances
+                if balance["symbol"] == recommendation["token"]
+            ),
+            None,
+        )
+        if not holding or not holding.get("chain"):
+            continue
+        try:
+            available = float(holding["balance"])
+        except (TypeError, ValueError):
+            continue
+        if available <= 0:
+            continue
+
+        amount = min(available, 0.1)
+        try:
+            quote = call_advisor_tool(
+                client,
+                "get_quote",
+                {
+                    "from_token": recommendation["token"],
+                    "to_token": "USDC",
+                    "amount": str(amount),
+                    "chain": holding["chain"],
+                },
+            )
+            if isinstance(quote, dict):
+                output = quote.get("to_amount", quote.get("amount_out", "?"))
+            else:
+                output = "?"
+            print(
+                f"  {amount} {recommendation['token']} → {output} USDC "
+                f"on {holding['chain']}"
+            )
+        except Exception as exc:  # Example CLI: report quote failure and continue.
+            print(f"  Quote unavailable for {recommendation['token']}: {exc}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Read-only Suwappu hosted-MCP portfolio advisor example"
+    )
+    parser.add_argument(
+        "--catalog",
+        action="store_true",
+        help="inspect the public MCP tool/resource/prompt catalog; no API key required",
+    )
+    parser.add_argument(
+        "--quotes",
+        action="store_true",
+        help="also request illustrative read-only get_quote results",
+    )
+    args = parser.parse_args()
+
+    api_key = os.environ.get("SUWAPPU_API_KEY", "")
+    client = McpClient(api_key)
+
+    if args.catalog:
+        render_catalog(client)
+        return
+
+    if not api_key:
+        raise RuntimeError("SUWAPPU_API_KEY is required for portfolio analysis")
+
+    wallet_address = os.environ.get("WALLET_ADDRESS", "")
+    if not re.fullmatch(r"0x[a-fA-F0-9]{40}", wallet_address):
+        raise RuntimeError(
+            "WALLET_ADDRESS must be the authenticated agent's "
+            "0x-prefixed managed EVM wallet"
+        )
+
+    initialized = client.initialize()
+    tools = client.list_tools()
+    verify_required_tools(tools)
+    server = initialized.get("serverInfo", {})
+    print(
+        f"Connected to {server.get('name', 'unknown')} "
+        f"v{server.get('version', 'unknown')}; discovered {len(tools)} tools."
+    )
+    print(
+        "Advisor-local capability set: "
+        + ", ".join(sorted(ADVISOR_TOOL_ALLOWLIST))
+    )
+
+    portfolio = parse_portfolio(
+        call_advisor_tool(
+            client,
+            "get_portfolio",
+            {"wallet_address": wallet_address},
+        )
+    )
+    if not portfolio["balances"] or portfolio["total_usd"] <= 0:
+        print("Portfolio has no positive balance valuation to analyze.")
+        return
+
     print(f"\nPortfolio value: ${portfolio['total_usd']:,.2f}")
-    for bal in portfolio["balances"]:
-        pct = (bal["usd_value"] / portfolio["total_usd"]) * 100
-        print(f"  {bal['symbol']:>6} | {bal['balance']:>12} | ${bal['usd_value']:>10,.2f} | {pct:>5.1f}%")
+    for balance in portfolio["balances"]:
+        pct = (balance["usd_value"] / portfolio["total_usd"]) * 100
+        print(
+            f"  {balance['symbol']:>6} | {balance['balance']:>12} | "
+            f"${balance['usd_value']:>10,.2f} | {pct:>5.1f}%"
+        )
 
-    # Step 4: Fetch prices
-    symbols = [b["symbol"] for b in portfolio["balances"]]
-    print(f"\nFetching prices for {', '.join(symbols)}...")
-    prices = client.call_tool("get_prices", {
-        "symbols": ",".join(symbols),
-    })
-    price_data = prices.get("prices", prices)
+    symbols = sorted({balance["symbol"] for balance in portfolio["balances"]})
+    prices = parse_prices(
+        call_advisor_tool(
+            client,
+            "get_prices",
+            {"symbols": ",".join(symbols)},
+        )
+    )
+    chains = call_advisor_tool(client, "list_chains")
 
-    for symbol, data in price_data.items():
-        change = data.get("change_24h", 0)
-        arrow = "▲" if change > 0 else "▼" if change < 0 else "─"
-        print(f"  {symbol}: ${data['usd']:,.2f} {arrow} {change:+.1f}%")
-
-    # Step 5: Fetch supported chains
-    print("\nFetching supported chains...")
-    chains = client.call_tool("list_chains")
-
-    # Step 6: Generate analysis
-    print("\nAnalyzing portfolio...")
-    ai_result = analyze_with_ai(portfolio, price_data, chains)
-
+    report, recommendations = rule_based_analysis(portfolio, prices)
+    ai_result = analyze_with_ai(portfolio, prices, chains)
     if ai_result:
-        print("\n" + ai_result)
-        recommendations = []  # AI provides its own recommendations
+        print("\nAI research notes:\n")
+        print(ai_result)
+        print("\nHeuristic cross-check:\n")
     else:
-        print("\n(No AI key found — using rule-based analysis)")
-        report, recommendations = rule_based_analysis(portfolio, price_data)
-        print(report)
+        print(
+            "\n(No AI provider + model configured — "
+            "using the deterministic heuristic.)\n"
+        )
+    print(report)
 
-    # Step 7: Get quotes for recommendations
-    if recommendations:
-        print("\nFetching quotes for recommended trades...")
-        for rec in recommendations:
-            if rec["action"] == "sell":
-                # Show quote for selling some of the overweight token
-                try:
-                    quote = client.call_tool("get_quote", {
-                        "from_token": rec["token"],
-                        "to_token": "USDC",
-                        "amount": "0.1",  # Small sample amount
-                        "chain": "ethereum",
-                    })
-                    print(f"  Sample quote: 0.1 {rec['token']} → {quote.get('to_amount', quote.get('amount_out', '?'))} USDC")
-                except Exception as e:
-                    print(f"  Could not quote {rec['token']}: {e}")
-            elif rec["action"] == "buy":
-                try:
-                    quote = client.call_tool("get_quote", {
-                        "from_token": "USDC",
-                        "to_token": rec["token"],
-                        "amount": "100",  # $100 sample
-                        "chain": "ethereum",
-                    })
-                    print(f"  Sample quote: 100 USDC → {quote.get('to_amount', quote.get('amount_out', '?'))} {rec['token']}")
-                except Exception as e:
-                    print(f"  Could not quote {rec['token']}: {e}")
+    if args.quotes and recommendations:
+        show_illustrative_quotes(client, portfolio, recommendations)
 
-    print("\nDone. This is not financial advice — always do your own research.")
+    print(
+        "\nDone. This example never calls execute_swap "
+        "and never submits managed execution."
+    )
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (RuntimeError, requests.RequestException, ValueError) as exc:
+        raise SystemExit(f"Error: {exc}") from exc

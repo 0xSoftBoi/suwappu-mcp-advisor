@@ -1,123 +1,116 @@
-import { describe, it, expect } from "bun:test";
+import { describe, expect, it } from "bun:test";
+import { ruleBasedAnalysis, type Portfolio } from "../src/analysis.js";
+import {
+  MCP_PROTOCOL_VERSION,
+  initializeParams,
+  parseToolResult,
+} from "../src/mcp.js";
+import { assertAdvisorToolAllowed } from "../src/policy.js";
 
-interface Balance {
-  symbol: string;
-  chain: string;
-  usd_value: number;
-}
+const concentrated: Portfolio = {
+  balances: [
+    {
+      symbol: "ETH",
+      chain: "ethereum",
+      balance: "0.25",
+      usd_value: 900,
+    },
+    {
+      symbol: "USDC",
+      chain: "base",
+      balance: "100",
+      usd_value: 100,
+    },
+  ],
+  total_usd: 1000,
+};
 
-const stableSymbols = new Set(["USDC", "USDT", "DAI"]);
+describe("ruleBasedAnalysis", () => {
+  it("uses the production concentration and stablecoin logic", () => {
+    const result = ruleBasedAnalysis(concentrated, {
+      ETH: { usd: 3600, change_24h: 2 },
+      USDC: { usd: 1, change_24h: 0 },
+    });
 
-function concentrationRisk(balances: Balance[], totalUsd: number): string[] {
-  const warnings: string[] = [];
-  for (const b of balances) {
-    const pct = (b.usd_value / totalUsd) * 100;
-    if (pct > 50) warnings.push(`${b.symbol} at ${pct.toFixed(1)}%`);
-  }
-  return warnings;
-}
-
-function diversificationScore(balances: Balance[]): number {
-  const chains = new Set(balances.map(b => b.chain));
-  return Math.min(10, balances.length * 2 + chains.size);
-}
-
-function stablecoinRatio(balances: Balance[], totalUsd: number): number {
-  const stableUsd = balances.filter(b => stableSymbols.has(b.symbol)).reduce((sum, b) => sum + b.usd_value, 0);
-  return totalUsd > 0 ? (stableUsd / totalUsd) * 100 : 0;
-}
-
-const samplePortfolio: Balance[] = [
-  { symbol: "ETH", chain: "ethereum", usd_value: 43000 },
-  { symbol: "USDC", chain: "ethereum", usd_value: 3200 },
-  { symbol: "DAI", chain: "base", usd_value: 1300 },
-];
-const totalUsd = 47500;
-
-describe("concentration risk", () => {
-  it("should warn when token is >50% of portfolio", () => {
-    const warnings = concentrationRisk(samplePortfolio, totalUsd);
-    expect(warnings.length).toBe(1);
-    expect(warnings[0]).toContain("ETH");
+    expect(result.report).toContain("ETH is 90.0% of portfolio");
+    expect(result.report).toContain("Stablecoins: $100.00 (10.0%)");
+    expect(result.recommendations).toEqual([
+      expect.objectContaining({ action: "sell", token: "ETH" }),
+    ]);
   });
 
-  it("should not warn for balanced portfolio", () => {
-    const balanced = [
-      { symbol: "ETH", chain: "ethereum", usd_value: 4000 },
-      { symbol: "BTC", chain: "ethereum", usd_value: 3000 },
-      { symbol: "SOL", chain: "solana", usd_value: 3000 },
-    ];
-    expect(concentrationRisk(balanced, 10000).length).toBe(0);
-  });
+  it("returns a consistent empty result for a zero-value portfolio", () => {
+    const result = ruleBasedAnalysis(
+      { balances: [], total_usd: 0 },
+      {},
+    );
 
-  it("should warn at exactly 51%", () => {
-    const edge = [
-      { symbol: "ETH", chain: "ethereum", usd_value: 51 },
-      { symbol: "USDC", chain: "ethereum", usd_value: 49 },
-    ];
-    expect(concentrationRisk(edge, 100).length).toBe(1);
+    expect(result.report).toBe("Portfolio has no positive USD valuation to analyze.");
+    expect(result.recommendations).toEqual([]);
   });
 });
 
-describe("diversification score", () => {
-  it("should score based on tokens * 2 + chains", () => {
-    expect(diversificationScore(samplePortfolio)).toBe(8); // 3*2 + 2
-  });
-
-  it("should cap at 10", () => {
-    const many = Array.from({ length: 10 }, (_, i) => ({
-      symbol: `T${i}`, chain: `c${i}`, usd_value: 100,
-    }));
-    expect(diversificationScore(many)).toBe(10);
-  });
-
-  it("should score 3 for single token single chain", () => {
-    const single = [{ symbol: "ETH", chain: "ethereum", usd_value: 100 }];
-    expect(diversificationScore(single)).toBe(3); // 1*2 + 1
+describe("MCP handshake", () => {
+  it("advertises the current protocol and client identity", () => {
+    expect(MCP_PROTOCOL_VERSION).toBe("2025-06-18");
+    expect(initializeParams()).toEqual({
+      protocolVersion: "2025-06-18",
+      capabilities: {},
+      clientInfo: {
+        name: "suwappu-mcp-advisor",
+        version: "1.1.0",
+      },
+    });
   });
 });
 
-describe("stablecoin identification", () => {
-  it("should identify USDC, USDT, DAI", () => {
-    expect(stableSymbols.has("USDC")).toBe(true);
-    expect(stableSymbols.has("USDT")).toBe(true);
-    expect(stableSymbols.has("DAI")).toBe(true);
+describe("MCP tool result parsing", () => {
+  it("prefers structuredContent when the server provides it", () => {
+    expect(
+      parseToolResult({
+        structuredContent: { prices: { ETH: { usd: 3500 } } },
+        content: [{ type: "text", text: "{\"ignored\":true}" }],
+      }),
+    ).toEqual({ prices: { ETH: { usd: 3500 } } });
   });
 
-  it("should not identify ETH, BTC, SOL", () => {
-    expect(stableSymbols.has("ETH")).toBe(false);
-    expect(stableSymbols.has("BTC")).toBe(false);
-  });
-});
-
-describe("stablecoin ratio", () => {
-  it("should calculate correct ratio", () => {
-    const ratio = stablecoinRatio(samplePortfolio, totalUsd);
-    // (3200 + 1300) / 47500 = 9.47%
-    expect(ratio).toBeCloseTo(9.47, 0);
+  it("falls back to JSON encoded in a text content block", () => {
+    expect(
+      parseToolResult({
+        content: [{ type: "text", text: "{\"chains\":[\"base\"]}" }],
+      }),
+    ).toEqual({ chains: ["base"] });
   });
 
-  it("should return 0 for empty portfolio", () => {
-    expect(stablecoinRatio([], 0)).toBe(0);
-  });
-
-  it("should return 100 for all-stable portfolio", () => {
-    const allStable = [{ symbol: "USDC", chain: "base", usd_value: 1000 }];
-    expect(stablecoinRatio(allStable, 1000)).toBe(100);
+  it("fails closed on tool-level MCP errors", () => {
+    expect(() =>
+      parseToolResult({
+        isError: true,
+        content: [{ type: "text", text: "quote rejected" }],
+      }),
+    ).toThrow("quote rejected");
   });
 });
 
-describe("MCP JSON-RPC", () => {
-  it("should build valid initialize request", () => {
-    const req = { jsonrpc: "2.0", id: 1, method: "initialize", params: {} };
-    expect(req.method).toBe("initialize");
+describe("advisor capability policy", () => {
+  it("allows only the small read/quote surface used by this example", () => {
+    for (const name of [
+      "get_portfolio",
+      "get_prices",
+      "list_chains",
+      "get_quote",
+    ]) {
+      expect(() => assertAdvisorToolAllowed(name)).not.toThrow();
+    }
   });
 
-  it("should build valid tools/call request", () => {
-    const req = {
-      jsonrpc: "2.0", id: 3, method: "tools/call",
-      params: { name: "get_portfolio", arguments: { wallet_address: "0xabc" } },
-    };
-    expect(req.params.name).toBe("get_portfolio");
+  it("does not trust discovery or annotations as authorization", () => {
+    for (const name of [
+      "execute_swap",
+      "simulate_swap",
+      "list_wallet_policies",
+    ]) {
+      expect(() => assertAdvisorToolAllowed(name)).toThrow("outside the advisor's local allowlist");
+    }
   });
 });
