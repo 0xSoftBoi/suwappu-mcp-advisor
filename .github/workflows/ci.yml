@@ -26,8 +26,10 @@ jobs:
         run: bun install
       - name: Typecheck
         run: bun run check
+      - name: Test
+        run: bun test
 
-  python-syntax:
+  python-quality:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -35,5 +37,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
       - name: Compile Python entrypoint
         run: python -m py_compile advisor.py
