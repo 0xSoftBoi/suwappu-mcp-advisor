@@ -12,7 +12,7 @@ import {
   type Balance,
   type Portfolio,
   type PriceData,
-  type Recommendation,
+  type ResearchFlag,
 } from "./analysis.js";
 import { McpClient, type McpTool } from "./mcp.js";
 import {
@@ -105,7 +105,7 @@ function verifyRequiredTools(tools: McpTool[]): void {
 }
 
 async function renderCatalog(client: McpClient): Promise<void> {
-  const initialized = await client.initialize();
+  const connected = await client.connect();
   const [tools, resources, prompts] = await Promise.all([
     client.listTools(),
     client.listResources(),
@@ -113,7 +113,7 @@ async function renderCatalog(client: McpClient): Promise<void> {
   ]);
 
   console.log(
-    `Connected to ${initialized.serverInfo.name} v${initialized.serverInfo.version} (MCP ${initialized.protocolVersion})`,
+    `Connected to ${connected.serverInfo.name} v${connected.serverInfo.version} (MCP ${connected.protocolVersion}, ${connected.era})`,
   );
   console.log(`\nTools (${tools.length}):`);
   for (const tool of tools) {
@@ -209,21 +209,21 @@ Discuss concentration, 24h moves, diversification, and stablecoin exposure. Clea
 async function showIllustrativeQuotes(
   client: McpClient,
   portfolio: Portfolio,
-  recommendations: Recommendation[],
+  flags: ResearchFlag[],
 ): Promise<void> {
   console.log(
     "\nIllustrative quotes (--quotes): get_quote is read-only; no transaction is prepared, signed, or broadcast.",
   );
 
-  for (const recommendation of recommendations) {
+  for (const flag of flags) {
     try {
-      if (recommendation.action === "sell") {
+      if (flag.action === "reduce_concentration") {
         const holding = portfolio.balances.find(
-          (balance) => balance.symbol === recommendation.token,
+          (balance) => balance.symbol === flag.token,
         );
         const balance = Number(holding?.balance);
         if (!holding || !Number.isFinite(balance) || balance <= 0 || !holding.chain) {
-          console.log(`  Skip ${recommendation.token}: no usable held balance/chain.`);
+          console.log(`  Skip ${flag.token}: no usable held balance/chain.`);
           continue;
         }
 
@@ -232,49 +232,21 @@ async function showIllustrativeQuotes(
           client,
           "get_quote",
           {
-            from_token: recommendation.token,
+            from_token: flag.token,
             to_token: "USDC",
             amount: String(amount),
             chain: holding.chain,
           },
         );
         console.log(
-          `  ${amount} ${recommendation.token} → ${String(
+          `  ${amount} ${flag.token} → ${String(
             quote.to_amount ?? quote.amount_out ?? "?",
           )} USDC on ${holding.chain}`,
-        );
-      } else if (recommendation.action === "buy") {
-        const funding = portfolio.balances.find(
-          (balance) => balance.symbol.toUpperCase() === "USDC" && balance.chain,
-        );
-        const available = Number(funding?.balance);
-        if (!funding || !Number.isFinite(available) || available <= 0) {
-          console.log(
-            `  Skip ${recommendation.token}: no USDC balance/chain to ground an illustrative quote.`,
-          );
-          continue;
-        }
-
-        const amount = Math.min(available, 100);
-        const quote = await callAdvisorTool<Record<string, unknown>>(
-          client,
-          "get_quote",
-          {
-            from_token: "USDC",
-            to_token: recommendation.token,
-            amount: String(amount),
-            chain: funding.chain,
-          },
-        );
-        console.log(
-          `  ${amount} USDC → ${String(
-            quote.to_amount ?? quote.amount_out ?? "?",
-          )} ${recommendation.token} on ${funding.chain}`,
         );
       }
     } catch (error) {
       console.log(
-        `  Quote unavailable for ${recommendation.token}: ${error instanceof Error ? error.message : String(error)}`,
+        `  Quote unavailable for ${flag.token}: ${error instanceof Error ? error.message : String(error)}`,
       );
     }
   }
@@ -297,11 +269,11 @@ async function main(): Promise<void> {
     );
   }
 
-  const initialized = await client.initialize();
+  const connected = await client.connect();
   const tools = await client.listTools();
   verifyRequiredTools(tools);
   console.log(
-    `Connected to ${initialized.serverInfo.name} v${initialized.serverInfo.version}; discovered ${tools.length} tools.`,
+    `Connected to ${connected.serverInfo.name} v${connected.serverInfo.version} via MCP ${connected.protocolVersion} (${connected.era}); discovered ${tools.length} tools.`,
   );
   console.log(
     `Advisor-local capability set: ${[...ADVISOR_TOOL_ALLOWLIST].join(", ")}`,
@@ -352,8 +324,8 @@ async function main(): Promise<void> {
   }
   console.log(analysis.report);
 
-  if (args.has("--quotes") && analysis.recommendations.length) {
-    await showIllustrativeQuotes(client, portfolio, analysis.recommendations);
+  if (args.has("--quotes") && analysis.flags.length) {
+    await showIllustrativeQuotes(client, portfolio, analysis.flags);
   }
 
   console.log(
