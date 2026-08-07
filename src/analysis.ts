@@ -10,11 +10,10 @@ export interface PriceData {
   change_24h: number | null;
 }
 
-export interface Recommendation {
-  action: "buy" | "sell" | "rebalance";
+export interface ResearchFlag {
+  action: "reduce_concentration" | "review_liquidity";
   token: string;
   reason: string;
-  target?: string;
 }
 
 export interface Portfolio {
@@ -27,14 +26,14 @@ const STABLE_SYMBOLS = new Set(["USDC", "USDT", "DAI"]);
 export function ruleBasedAnalysis(
   portfolio: Portfolio,
   prices: Record<string, PriceData>,
-): { report: string; recommendations: Recommendation[] } {
+): { report: string; flags: ResearchFlag[] } {
   const { balances, total_usd: totalUsd } = portfolio;
-  const recommendations: Recommendation[] = [];
+  const flags: ResearchFlag[] = [];
 
   if (!Number.isFinite(totalUsd) || totalUsd <= 0) {
     return {
       report: "Portfolio has no positive USD valuation to analyze.",
-      recommendations,
+      flags,
     };
   }
 
@@ -51,11 +50,10 @@ export function ruleBasedAnalysis(
       lines.push(
         `     WARNING: ${balance.symbol} is ${pct.toFixed(1)}% of portfolio (>50%)`,
       );
-      recommendations.push({
-        action: "sell",
+      flags.push({
+        action: "reduce_concentration",
         token: balance.symbol,
-        reason: `Over-concentrated at ${pct.toFixed(1)}%`,
-        target: "Research reducing concentration; do not execute from this report alone",
+        reason: `Held asset is ${pct.toFixed(1)}% of observed portfolio value (>50% example threshold)`,
       });
     } else if (pct > 30) {
       lines.push(
@@ -73,13 +71,6 @@ export function ruleBasedAnalysis(
       lines.push(`     UP: ${symbol} +${change.toFixed(1)}% — review concentration/risk`);
     } else if (change < -5) {
       lines.push(`     DOWN: ${symbol} ${change.toFixed(1)}% — research before acting`);
-      if (!balances.some((balance) => balance.symbol === symbol)) {
-        recommendations.push({
-          action: "buy",
-          token: symbol,
-          reason: `Down ${change.toFixed(1)}%; research signal only`,
-        });
-      }
     } else {
       lines.push(
         `     FLAT: ${symbol} ${change >= 0 ? "+" : ""}${change.toFixed(1)}%`,
@@ -106,27 +97,26 @@ export function ruleBasedAnalysis(
   );
   if (stablePct < 10) {
     lines.push("     FLAG: Stablecoin allocation is below this example's 10% heuristic.");
-    recommendations.push({
-      action: "rebalance",
+    flags.push({
+      action: "review_liquidity",
       token: "USDC",
-      reason: "Stablecoin allocation below the example's 10% heuristic",
+      reason: "Observed stablecoin allocation is below the example's 10% liquidity-review threshold",
     });
   } else if (stablePct > 60) {
     lines.push("     FLAG: Stablecoin allocation is above this example's 60% heuristic.");
   }
 
   lines.push("\n  5. RESEARCH FLAGS");
-  if (recommendations.length) {
-    recommendations.forEach((recommendation, index) => {
+  if (flags.length) {
+    flags.forEach((flag, index) => {
       lines.push(
-        `     ${index + 1}. ${recommendation.action.toUpperCase()} ${recommendation.token}: ${recommendation.reason}`,
+        `     ${index + 1}. ${flag.action.toUpperCase()} ${flag.token}: ${flag.reason}`,
       );
-      if (recommendation.target) lines.push(`        → ${recommendation.target}`);
     });
   } else {
     lines.push("     No heuristic flags triggered.");
   }
 
   lines.push("");
-  return { report: lines.join("\n"), recommendations };
+  return { report: lines.join("\n"), flags };
 }

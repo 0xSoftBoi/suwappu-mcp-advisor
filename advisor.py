@@ -9,6 +9,7 @@ the managed REST execution endpoint.
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import re
@@ -16,9 +17,15 @@ from typing import Any
 
 import requests
 
-MCP_PROTOCOL_VERSION = "2025-06-18"
+MCP_PROTOCOL_VERSION = "2026-07-28"
+LEGACY_MCP_PROTOCOL_VERSION = "2025-06-18"
 DEFAULT_MCP_URL = "https://api.suwappu.bot/mcp"
 REQUEST_TIMEOUT_SECONDS = 30
+PROTOCOL_VERSION_META = "io.modelcontextprotocol/protocolVersion"
+CLIENT_INFO_META = "io.modelcontextprotocol/clientInfo"
+CLIENT_CAPABILITIES_META = "io.modelcontextprotocol/clientCapabilities"
+SERVER_INFO_META = "io.modelcontextprotocol/serverInfo"
+CLIENT_INFO = {"name": "suwappu-mcp-advisor-python", "version": "1.2.0"}
 ADVISOR_TOOL_ALLOWLIST = {
     "get_portfolio",
     "get_prices",
@@ -54,6 +61,48 @@ def _decode_jsonrpc_response(response: requests.Response) -> dict[str, Any]:
     raise RuntimeError("MCP returned an SSE response without a JSON-RPC message")
 
 
+def encode_mcp_header_value(value: str) -> str:
+    """Encode a modern MCP header value using the spec's Base64 sentinel."""
+    safe_ascii = all(0x20 <= ord(char) <= 0x7E for char in value)
+    looks_encoded = value.startswith("=?base64?") and value.endswith("?=")
+    if safe_ascii and value.strip() == value and not looks_encoded:
+        return value
+    encoded = base64.b64encode(value.encode("utf-8")).decode("ascii")
+    return f"=?base64?{encoded}?="
+
+
+def modern_request_params(params: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Attach the self-describing metadata required by MCP 2026-07-28."""
+    output = dict(params or {})
+    existing_meta = output.get("_meta")
+    meta = dict(existing_meta) if isinstance(existing_meta, dict) else {}
+    meta.update(
+        {
+            PROTOCOL_VERSION_META: MCP_PROTOCOL_VERSION,
+            CLIENT_INFO_META: CLIENT_INFO,
+            CLIENT_CAPABILITIES_META: {},
+        }
+    )
+    output["_meta"] = meta
+    return output
+
+
+class McpRequestError(RuntimeError):
+    """Wire error that preserves enough detail for safe era negotiation."""
+
+    def __init__(
+        self,
+        message: str,
+        status: int,
+        code: int | None = None,
+        data: Any = None,
+    ) -> None:
+        super().__init__(message)
+        self.status = status
+        self.code = code
+        self.data = data
+
+
 class McpClient:
     """Small Streamable HTTP client for Suwappu's hosted MCP endpoint."""
 
@@ -63,31 +112,49 @@ class McpClient:
         self.request_id = 0
         self.session_id: str | None = None
         self.negotiated_protocol: str | None = None
+        self.era: str | None = None
 
-    def _headers(self) -> dict[str, str]:
+    def _headers(
+        self,
+        mode: str,
+        method: str,
+        params: dict[str, Any],
+    ) -> dict[str, str]:
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json, text/event-stream",
         }
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
+
+        if mode == "modern":
+            headers["MCP-Protocol-Version"] = MCP_PROTOCOL_VERSION
+            headers["Mcp-Method"] = method
+            if method in {"tools/call", "prompts/get"} and isinstance(
+                params.get("name"), str
+            ):
+                headers["Mcp-Name"] = encode_mcp_header_value(params["name"])
+            elif method == "resources/read" and isinstance(params.get("uri"), str):
+                headers["Mcp-Name"] = encode_mcp_header_value(params["uri"])
+            return headers
+
         if self.session_id:
             headers["Mcp-Session-Id"] = self.session_id
         if self.negotiated_protocol:
             headers["MCP-Protocol-Version"] = self.negotiated_protocol
         return headers
 
-    def _post(self, payload: dict[str, Any]) -> requests.Response:
+    def _post(
+        self,
+        payload: dict[str, Any],
+        headers: dict[str, str],
+    ) -> requests.Response:
         response = requests.post(
             self.url,
-            headers=self._headers(),
+            headers=headers,
             json=payload,
             timeout=REQUEST_TIMEOUT_SECONDS,
         )
-        response.raise_for_status()
-        session_id = response.headers.get("Mcp-Session-Id")
-        if session_id:
-            self.session_id = session_id
         return response
 
     def _next_id(self) -> int:
@@ -98,25 +165,72 @@ class McpClient:
         self,
         method: str,
         params: dict[str, Any] | None = None,
+        mode: str | None = None,
     ) -> dict[str, Any]:
+        wire_mode = mode or ("modern" if self.era == "modern" else "legacy")
+        clean_params = dict(params or {})
+        wire_params = (
+            modern_request_params(clean_params)
+            if wire_mode == "modern"
+            else clean_params
+        )
         response = self._post(
             {
                 "jsonrpc": "2.0",
                 "id": self._next_id(),
                 "method": method,
-                "params": params or {},
-            }
+                "params": wire_params,
+            },
+            self._headers(wire_mode, method, clean_params),
         )
-        data = _decode_jsonrpc_response(response)
+        if wire_mode == "legacy":
+            session_id = response.headers.get("Mcp-Session-Id")
+            if session_id:
+                self.session_id = session_id
+
+        try:
+            data = _decode_jsonrpc_response(response)
+        except (RuntimeError, ValueError) as exc:
+            if not response.ok:
+                raise McpRequestError(
+                    f"Suwappu MCP HTTP {response.status_code}: "
+                    f"{response.text or response.reason}",
+                    response.status_code,
+                ) from exc
+            raise
         if "error" in data:
             error = data["error"]
-            raise RuntimeError(
-                f"MCP error {error.get('code', 'unknown')}: "
-                f"{error.get('message', 'unknown error')}"
+            code = error.get("code") if isinstance(error, dict) else None
+            message = error.get("message") if isinstance(error, dict) else None
+            error_data = error.get("data") if isinstance(error, dict) else None
+            raise McpRequestError(
+                f"MCP error {code if code is not None else 'unknown'}: "
+                f"{message or 'unknown error'}",
+                response.status_code,
+                code if isinstance(code, int) else None,
+                error_data,
+            )
+        if not response.ok:
+            raise McpRequestError(
+                f"Suwappu MCP HTTP {response.status_code}: "
+                f"{response.text or response.reason}",
+                response.status_code,
             )
         result = data.get("result")
         if not isinstance(result, dict):
             raise RuntimeError(f"MCP method {method} returned no object result")
+        if wire_mode == "modern":
+            result_type = result.get("resultType")
+            if result_type == "input_required":
+                raise RuntimeError(
+                    f"MCP method {method} requires another input round; this read-only "
+                    "example does not auto-fulfil MRTR requests"
+                )
+            if result_type != "complete":
+                raise RuntimeError(
+                    f"MCP method {method} returned invalid 2026-07-28 "
+                    f"resultType: {result_type!r}"
+                )
         return result
 
     def _notify(
@@ -124,31 +238,87 @@ class McpClient:
         method: str,
         params: dict[str, Any] | None = None,
     ) -> None:
-        self._post(
+        response = self._post(
             {
                 "jsonrpc": "2.0",
                 "method": method,
                 "params": params or {},
-            }
+            },
+            self._headers("legacy", method, params or {}),
         )
+        response.raise_for_status()
+        session_id = response.headers.get("Mcp-Session-Id")
+        if session_id:
+            self.session_id = session_id
 
-    def initialize(self) -> dict[str, Any]:
+    @staticmethod
+    def _should_fall_back_to_legacy(exc: Exception) -> bool:
+        if not isinstance(exc, McpRequestError):
+            return False
+        if exc.code in {-32020, -32022}:
+            return False
+        return exc.code == -32601 or 400 <= exc.status < 500
+
+    def _connect_modern(self) -> dict[str, Any]:
+        result = self._send("server/discover", mode="modern")
+        versions = result.get("supportedVersions", [])
+        if not isinstance(versions, list) or MCP_PROTOCOL_VERSION not in versions:
+            offered = ", ".join(str(version) for version in versions) or "none"
+            raise RuntimeError(
+                f"MCP server discovery did not advertise {MCP_PROTOCOL_VERSION}; "
+                f"offered: {offered}"
+            )
+
+        meta = result.get("_meta", {})
+        server_info = meta.get(SERVER_INFO_META, {}) if isinstance(meta, dict) else {}
+        if not isinstance(server_info, dict):
+            server_info = {}
+        self.era = "modern"
+        self.negotiated_protocol = MCP_PROTOCOL_VERSION
+        self.session_id = None
+        return {
+            "era": "modern",
+            "protocolVersion": MCP_PROTOCOL_VERSION,
+            "capabilities": result.get("capabilities", {}),
+            "serverInfo": {
+                "name": str(server_info.get("name", "unknown")),
+                "version": str(server_info.get("version", "unknown")),
+            },
+        }
+
+    def _connect_legacy(self) -> dict[str, Any]:
         result = self._send(
             "initialize",
             {
-                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "protocolVersion": LEGACY_MCP_PROTOCOL_VERSION,
                 "capabilities": {},
-                "clientInfo": {
-                    "name": "suwappu-mcp-advisor-python",
-                    "version": "1.1.0",
-                },
+                "clientInfo": CLIENT_INFO,
             },
+            mode="legacy",
         )
+        self.era = "legacy"
         self.negotiated_protocol = str(
-            result.get("protocolVersion", MCP_PROTOCOL_VERSION)
+            result.get("protocolVersion", LEGACY_MCP_PROTOCOL_VERSION)
         )
         self._notify("notifications/initialized")
-        return result
+        return {
+            "era": "legacy",
+            "protocolVersion": self.negotiated_protocol,
+            "capabilities": result.get("capabilities", {}),
+            "serverInfo": result.get("serverInfo", {}),
+        }
+
+    def connect(self) -> dict[str, Any]:
+        try:
+            return self._connect_modern()
+        except Exception as exc:
+            if not self._should_fall_back_to_legacy(exc):
+                raise
+            return self._connect_legacy()
+
+    def initialize(self) -> dict[str, Any]:
+        """Backward-compatible alias for connect()."""
+        return self.connect()
 
     def list_tools(self) -> list[dict[str, Any]]:
         result = self._send("tools/list")
@@ -286,10 +456,10 @@ def rule_based_analysis(
 ) -> tuple[str, list[dict[str, str]]]:
     balances = portfolio.get("balances", [])
     total_usd = float(portfolio.get("total_usd", 0) or 0)
-    recommendations: list[dict[str, str]] = []
+    flags: list[dict[str, str]] = []
 
     if total_usd <= 0:
-        return "Portfolio has no positive USD valuation to analyze.", recommendations
+        return "Portfolio has no positive USD valuation to analyze.", flags
 
     lines = [
         "=" * 55,
@@ -303,11 +473,14 @@ def rule_based_analysis(
             lines.append(
                 f"     WARNING: {balance['symbol']} is {pct:.1f}% of portfolio (>50%)"
             )
-            recommendations.append(
+            flags.append(
                 {
-                    "action": "sell",
+                    "action": "reduce_concentration",
                     "token": str(balance["symbol"]),
-                    "reason": f"Over-concentrated at {pct:.1f}%; research signal only",
+                    "reason": (
+                        f"Held asset is {pct:.1f}% of observed portfolio value "
+                        "(>50% example threshold)"
+                    ),
                 }
             )
         elif pct > 30:
@@ -357,11 +530,14 @@ def rule_based_analysis(
         lines.append(
             "     FLAG: Stablecoin allocation is below this example's 10% heuristic."
         )
-        recommendations.append(
+        flags.append(
             {
-                "action": "rebalance",
+                "action": "review_liquidity",
                 "token": "USDC",
-                "reason": "Stablecoin allocation below the example's 10% heuristic",
+                "reason": (
+                    "Observed stablecoin allocation is below the example's 10% "
+                    "liquidity-review threshold"
+                ),
             }
         )
     elif stable_pct > 60:
@@ -370,16 +546,16 @@ def rule_based_analysis(
         )
 
     lines.append("\n  5. RESEARCH FLAGS")
-    if recommendations:
-        for index, recommendation in enumerate(recommendations, 1):
+    if flags:
+        for index, flag in enumerate(flags, 1):
             lines.append(
-                f"     {index}. {recommendation['action'].upper()} "
-                f"{recommendation['token']}: {recommendation['reason']}"
+                f"     {index}. {flag['action'].upper()} "
+                f"{flag['token']}: {flag['reason']}"
             )
     else:
         lines.append("     No heuristic flags triggered.")
 
-    return "\n".join(lines), recommendations
+    return "\n".join(lines), flags
 
 
 def analyze_with_ai(
@@ -458,16 +634,17 @@ def verify_required_tools(tools: list[dict[str, Any]]) -> None:
 
 
 def render_catalog(client: McpClient) -> None:
-    initialized = client.initialize()
+    connected = client.connect()
     tools = client.list_tools()
     resources = client.list_resources()
     prompts = client.list_prompts()
-    server = initialized.get("serverInfo", {})
+    server = connected.get("serverInfo", {})
 
     print(
         f"Connected to {server.get('name', 'unknown')} "
         f"v{server.get('version', 'unknown')} "
-        f"(MCP {initialized.get('protocolVersion', 'unknown')})"
+        f"(MCP {connected.get('protocolVersion', 'unknown')}, "
+        f"{connected.get('era', 'unknown')})"
     )
     print(f"\nTools ({len(tools)}):")
     for tool in tools:
@@ -498,7 +675,7 @@ def render_catalog(client: McpClient) -> None:
 def show_illustrative_quotes(
     client: McpClient,
     portfolio: dict[str, Any],
-    recommendations: list[dict[str, str]],
+    flags: list[dict[str, str]],
 ) -> None:
     print(
         "\nIllustrative quotes (--quotes): get_quote is read-only; "
@@ -506,14 +683,14 @@ def show_illustrative_quotes(
     )
     balances = portfolio["balances"]
 
-    for recommendation in recommendations:
-        if recommendation["action"] != "sell":
+    for flag in flags:
+        if flag["action"] != "reduce_concentration":
             continue
         holding = next(
             (
                 balance
                 for balance in balances
-                if balance["symbol"] == recommendation["token"]
+                if balance["symbol"] == flag["token"]
             ),
             None,
         )
@@ -532,7 +709,7 @@ def show_illustrative_quotes(
                 client,
                 "get_quote",
                 {
-                    "from_token": recommendation["token"],
+                    "from_token": flag["token"],
                     "to_token": "USDC",
                     "amount": str(amount),
                     "chain": holding["chain"],
@@ -543,11 +720,11 @@ def show_illustrative_quotes(
             else:
                 output = "?"
             print(
-                f"  {amount} {recommendation['token']} → {output} USDC "
+                f"  {amount} {flag['token']} → {output} USDC "
                 f"on {holding['chain']}"
             )
         except Exception as exc:  # Example CLI: report quote failure and continue.
-            print(f"  Quote unavailable for {recommendation['token']}: {exc}")
+            print(f"  Quote unavailable for {flag['token']}: {exc}")
 
 
 def main() -> None:
@@ -583,13 +760,15 @@ def main() -> None:
             "0x-prefixed managed EVM wallet"
         )
 
-    initialized = client.initialize()
+    connected = client.connect()
     tools = client.list_tools()
     verify_required_tools(tools)
-    server = initialized.get("serverInfo", {})
+    server = connected.get("serverInfo", {})
     print(
         f"Connected to {server.get('name', 'unknown')} "
-        f"v{server.get('version', 'unknown')}; discovered {len(tools)} tools."
+        f"v{server.get('version', 'unknown')} via MCP "
+        f"{connected.get('protocolVersion', 'unknown')} "
+        f"({connected.get('era', 'unknown')}); discovered {len(tools)} tools."
     )
     print(
         "Advisor-local capability set: "
@@ -625,7 +804,7 @@ def main() -> None:
     )
     chains = call_advisor_tool(client, "list_chains")
 
-    report, recommendations = rule_based_analysis(portfolio, prices)
+    report, flags = rule_based_analysis(portfolio, prices)
     ai_result = analyze_with_ai(portfolio, prices, chains)
     if ai_result:
         print("\nAI research notes:\n")
@@ -638,8 +817,8 @@ def main() -> None:
         )
     print(report)
 
-    if args.quotes and recommendations:
-        show_illustrative_quotes(client, portfolio, recommendations)
+    if args.quotes and flags:
+        show_illustrative_quotes(client, portfolio, flags)
 
     print(
         "\nDone. This example never calls execute_swap "

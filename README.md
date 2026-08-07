@@ -2,15 +2,16 @@
 
 A builder-focused, read-only portfolio advisor for [Suwappu](https://suwappu.bot)'s hosted MCP server.
 
-This repo is deliberately small enough to copy from. It shows the MCP handshake, discovery, structured tool results, local capability policy, portfolio/price reads, and optional read-only quotes without hiding custody boundaries.
+This repo is deliberately small enough to copy from. It shows modern MCP discovery, legacy fallback, structured tool results, local capability policy, portfolio/price reads, and optional read-only quotes without hiding custody boundaries. It also shows where an MCP demo should end and a sellable monitoring product can begin.
 
 > Research example only — not financial advice. This program never calls `execute_swap` and never submits managed execution.
 
 ## What this example teaches
 
-- Connect to `https://api.suwappu.bot/mcp` with MCP `2025-06-18`.
-- Send `initialize` with client metadata, then `notifications/initialized`.
-- Accept both JSON and SSE Streamable HTTP responses and preserve an MCP session when the server issues one.
+- Prefer stateless MCP `2026-07-28`: probe `server/discover`, send self-describing request `_meta`, and mirror the required `MCP-Protocol-Version` / `Mcp-Method` / `Mcp-Name` HTTP headers.
+- Fall back to the `2025-06-18` `initialize` + `notifications/initialized` handshake when a legacy server rejects modern discovery.
+- Accept both JSON and SSE Streamable HTTP responses and preserve an MCP session only on the legacy path.
+- Require `resultType: "complete"` on modern responses; fail closed on multi-round `input_required` because this example does not need interactive MCP requests.
 - Discover tools, resources, and prompts instead of hard-coding the server version.
 - Treat MCP `annotations` as descriptive hints, not authorization.
 - Apply a local tool allowlist before every tool call.
@@ -27,6 +28,8 @@ get_quote
 ```
 
 `get_quote` is only called when you explicitly pass `--quotes`.
+
+The TypeScript and Python files hand-roll the small amount of wire protocol on purpose so you can see the trust boundary. For a production client, prefer an official Tier 1 MCP SDK so protocol revisions and transport edge cases are maintained upstream: [TypeScript SDK](https://github.com/modelcontextprotocol/typescript-sdk) or [Python SDK](https://github.com/modelcontextprotocol/python-sdk). This example is the Suwappu-specific policy/product layer to keep even when you swap the transport implementation.
 
 ## Hosted MCP surface
 
@@ -127,13 +130,13 @@ python advisor.py
 python advisor.py --quotes
 ```
 
-`--quotes` is still non-transactional: it calls `get_quote` only for amounts and chains grounded in the portfolio. It never prepares, signs, or broadcasts a transaction.
+`--quotes` is still non-transactional: it calls `get_quote` only for a held asset that crossed the example's concentration threshold, with amount and chain grounded in the observed portfolio. A price drop in an unheld asset never becomes a buy instruction. The CLI never prepares, signs, or broadcasts a transaction.
 
 ## Builder pattern
 
 A safe Suwappu MCP client has two policies: what the server advertises and what your application is allowed to use.
 
-1. Initialize MCP and discover the current catalog.
+1. Negotiate the MCP era and discover the current catalog.
 2. Intersect discovered capabilities with an application-owned allowlist.
 3. Validate tool inputs from your own application context.
 4. Treat tool-level `isError` as failure and prefer typed `structuredContent`.
@@ -142,11 +145,22 @@ A safe Suwappu MCP client has two policies: what the server advertises and what 
 
 This repo implements those rules in both `src/mcp.ts` / `src/policy.ts` and `advisor.py`.
 
+The heuristic deliberately emits research flags such as `reduce_concentration` and `review_liquidity`, not `buy` / `sell` orders. The thresholds are example policy inputs, not evidence that a trade is profitable or suitable.
+
+## Turn the example into a product
+
+The highest-value next step is usually not “make the advisor trade.” It is “make the evidence useful repeatedly.” See [BUILDING_A_PRODUCT.md](BUILDING_A_PRODUCT.md) for a concrete path from this CLI to paid monitoring, team workflows, approval handoffs, event records, unit economics, and retention metrics.
+
+Keep two scorecards separate:
+
+- **Builder economics:** subscription / usage revenue minus Suwappu credits, model calls, storage, notifications, and support.
+- **Customer portfolio P&L:** an outcome of the customer's assets and decisions. Do not use it as your SaaS revenue or promise it as a return.
+
 ## Package/version boundary
 
 The hosted MCP endpoint is the runtime source of truth.
 
-As of this repo update:
+Verified 2026-08-07:
 
 - `@suwappu/sdk` on npm is `0.4.0`; newer `0.6.0` TypeScript SDK work exists in the core repository but is not the published npm package yet.
 - `@suwappu/mcp-server` on npm is `0.1.1`; current `0.6.0` source is a forwarding stdio bridge to the hosted endpoint and is not published yet.
@@ -154,11 +168,14 @@ As of this repo update:
 
 That is why this example talks directly to hosted MCP instead of pretending unpublished package versions are installable.
 
+MCP itself has also moved quickly: `2026-07-28` is the current GA protocol revision. The client is dual-era so an upgraded hosted endpoint can use the modern stateless protocol without making the example stop working against a still-legacy deployment.
+
 ## Links
 
 - [Suwappu](https://suwappu.bot)
 - [Suwappu docs](https://docs.suwappu.bot)
 - [Suwappu core](https://github.com/0xSoftBoi/suwappubot)
+- [MCP 2026-07-28 specification](https://modelcontextprotocol.io/specification/2026-07-28)
 
 ## License
 

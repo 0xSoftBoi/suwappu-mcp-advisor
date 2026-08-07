@@ -41,3 +41,5 @@ jobs:
         run: pip install -r requirements.txt
       - name: Compile Python entrypoint
         run: python -m py_compile advisor.py
+      - name: Test Python client and advisor parity
+        run: python -m unittest discover -s tests -p 'test_*.py'

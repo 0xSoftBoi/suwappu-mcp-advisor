@@ -1,6 +1,6 @@
 {
   "name": "suwappu-mcp-advisor",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Read-only portfolio advisor example for Suwappu's hosted MCP server",
   "type": "module",
   "bin": {

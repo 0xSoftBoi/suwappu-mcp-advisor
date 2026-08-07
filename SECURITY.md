@@ -1,9 +1,12 @@
 # Security Policy
 
 This repository is a satellite / example application built on the
-[Suwappu API](https://github.com/0xSoftBoi/suwappubot). Some examples can
-initiate real financial transactions when execution is enabled. Treat API keys,
-wallet credentials, and configuration as sensitive.
+[Suwappu API](https://github.com/0xSoftBoi/suwappubot). This advisor is
+intentionally non-transactional: it reads portfolio / market data and can request
+an illustrative `get_quote` only when `--quotes` is explicit. It never calls
+`execute_swap`, never signs or broadcasts a transaction, and never calls the
+managed execution API. Treat API keys, wallet identifiers, and configuration as
+sensitive anyway.
 
 ## Reporting a vulnerability
 
@@ -21,12 +24,20 @@ contracts, custody/key-management layer, or shared SDK should be reported
 upstream through the
 [core security policy](https://github.com/0xSoftBoi/suwappubot/security/policy).
 
-## Custody and execution model
+## Capability and custody boundary
 
-Suwappu supports both self-custody and custodial product flows. This satellite
-repository does not make a custody guarantee: behavior depends on the API mode
-and configuration in use. Prefer dry-run or read-only modes where available,
-use test wallets before enabling execution, and never commit credentials.
+The local allowlist is the security boundary for this example. Discovery and MCP
+tool annotations describe server capabilities but do not authorize this client
+to use them. The allowlist contains `get_portfolio`, `get_prices`, `list_chains`,
+and `get_quote` only.
+
+Suwappu exposes transaction preparation and managed execution elsewhere, but
+adding either to a fork is a new money-path capability. Review its custody,
+authorization, simulation, retry/idempotency, and approval design separately;
+do not infer that this repository's read-only safety properties still apply.
+
+Never commit credentials. Use least-privilege API keys and disposable test
+wallets when experimenting with a fork that adds any execution capability.
 
 ## Our commitment
 
