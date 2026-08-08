@@ -8,6 +8,7 @@ import {
   McpClient,
   type McpFetch,
   modernRequestParams,
+  operationTimeoutMs,
   parseToolResult,
 } from "../src/mcp.js";
 import { assertAdvisorToolAllowed } from "../src/policy.js";
@@ -79,7 +80,7 @@ describe("MCP dual-era protocol", () => {
         "io.modelcontextprotocol/clientCapabilities": {},
         "io.modelcontextprotocol/clientInfo": {
           name: "suwappu-mcp-advisor",
-          version: "1.2.0",
+          version: "2.0.0",
         },
       },
     });
@@ -88,9 +89,17 @@ describe("MCP dual-era protocol", () => {
       capabilities: {},
       clientInfo: {
         name: "suwappu-mcp-advisor",
-        version: "1.2.0",
+        version: "2.0.0",
       },
     });
+  });
+
+  it("bounds the MCP/provider operation deadline", () => {
+    expect(operationTimeoutMs(undefined)).toBe(25_000);
+    expect(operationTimeoutMs("100")).toBe(100);
+    expect(operationTimeoutMs("30000")).toBe(30_000);
+    expect(() => operationTimeoutMs("99")).toThrow("100 to 30000");
+    expect(() => operationTimeoutMs("30001")).toThrow("100 to 30000");
   });
 
   it("encodes MCP header values that are unsafe or sentinel-like", () => {

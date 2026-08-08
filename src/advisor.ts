@@ -14,7 +14,7 @@ import {
   type PriceData,
   type ResearchFlag,
 } from "./analysis.js";
-import { McpClient, type McpTool } from "./mcp.js";
+import { McpClient, operationTimeoutMs, type McpTool } from "./mcp.js";
 import {
   ADVISOR_TOOL_ALLOWLIST,
   assertAdvisorToolAllowed,
@@ -168,9 +168,10 @@ Discuss concentration, 24h moves, diversification, and stablecoin exposure. Clea
         messages: [{ role: "user", content: prompt }],
         temperature: 0.3,
       }),
+      signal: AbortSignal.timeout(operationTimeoutMs()),
     });
     if (!response.ok) {
-      throw new Error(`OpenAI error ${response.status}: ${await response.text()}`);
+      throw new Error(`OpenAI error ${response.status}`);
     }
     const data = (await response.json()) as {
       choices?: Array<{ message?: { content?: string } }>;
@@ -193,9 +194,10 @@ Discuss concentration, 24h moves, diversification, and stablecoin exposure. Clea
         max_tokens: 1024,
         messages: [{ role: "user", content: prompt }],
       }),
+      signal: AbortSignal.timeout(operationTimeoutMs()),
     });
     if (!response.ok) {
-      throw new Error(`Anthropic error ${response.status}: ${await response.text()}`);
+      throw new Error(`Anthropic error ${response.status}`);
     }
     const data = (await response.json()) as {
       content?: Array<{ type?: string; text?: string }>;

@@ -25,7 +25,7 @@ PROTOCOL_VERSION_META = "io.modelcontextprotocol/protocolVersion"
 CLIENT_INFO_META = "io.modelcontextprotocol/clientInfo"
 CLIENT_CAPABILITIES_META = "io.modelcontextprotocol/clientCapabilities"
 SERVER_INFO_META = "io.modelcontextprotocol/serverInfo"
-CLIENT_INFO = {"name": "suwappu-mcp-advisor-python", "version": "1.2.0"}
+CLIENT_INFO = {"name": "suwappu-mcp-advisor-python", "version": "2.0.0"}
 ADVISOR_TOOL_ALLOWLIST = {
     "get_portfolio",
     "get_prices",
@@ -193,8 +193,7 @@ class McpClient:
         except (RuntimeError, ValueError) as exc:
             if not response.ok:
                 raise McpRequestError(
-                    f"Suwappu MCP HTTP {response.status_code}: "
-                    f"{response.text or response.reason}",
+                    f"Suwappu MCP HTTP {response.status_code}",
                     response.status_code,
                 ) from exc
             raise
@@ -212,8 +211,7 @@ class McpClient:
             )
         if not response.ok:
             raise McpRequestError(
-                f"Suwappu MCP HTTP {response.status_code}: "
-                f"{response.text or response.reason}",
+                f"Suwappu MCP HTTP {response.status_code}",
                 response.status_code,
             )
         result = data.get("result")
