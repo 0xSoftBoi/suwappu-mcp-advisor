@@ -3,8 +3,9 @@ export const LEGACY_MCP_PROTOCOL_VERSION = "2025-06-18";
 
 const CLIENT_INFO = {
   name: "suwappu-mcp-advisor",
-  version: "1.2.0",
+  version: "2.0.0",
 };
+export const DEFAULT_OPERATION_TIMEOUT_MS = 25_000;
 const PROTOCOL_VERSION_META = "io.modelcontextprotocol/protocolVersion";
 const CLIENT_INFO_META = "io.modelcontextprotocol/clientInfo";
 const CLIENT_CAPABILITIES_META = "io.modelcontextprotocol/clientCapabilities";
@@ -82,6 +83,17 @@ export class McpRequestError extends Error {
     super(message);
     this.name = "McpRequestError";
   }
+}
+
+export function operationTimeoutMs(
+  raw = process.env.SUWAPPU_OPERATION_TIMEOUT_MS,
+): number {
+  if (raw === undefined || raw === "") return DEFAULT_OPERATION_TIMEOUT_MS;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < 100 || parsed > 30_000) {
+    throw new Error("SUWAPPU_OPERATION_TIMEOUT_MS must be an integer from 100 to 30000");
+  }
+  return parsed;
 }
 
 function defaultMcpUrl(): string {
@@ -197,6 +209,7 @@ export class McpClient {
     private readonly apiKey = "",
     url = defaultMcpUrl(),
     private readonly fetcher: McpFetch = fetch,
+    private readonly timeoutMs = operationTimeoutMs(),
   ) {
     this.url = url;
   }
@@ -253,6 +266,7 @@ export class McpClient {
         method,
         params: wireParams,
       }),
+      signal: AbortSignal.timeout(this.timeoutMs),
     });
     if (mode === "legacy") this.rememberLegacySession(response);
 
@@ -266,7 +280,7 @@ export class McpClient {
     } catch (error) {
       if (!response.ok) {
         throw new McpRequestError(
-          `Suwappu MCP HTTP ${response.status}: ${text || response.statusText}`,
+          `Suwappu MCP HTTP ${response.status}`,
           response.status,
         );
       }
@@ -289,7 +303,7 @@ export class McpClient {
     }
     if (!response.ok) {
       throw new McpRequestError(
-        `Suwappu MCP HTTP ${response.status}: ${text || response.statusText}`,
+        `Suwappu MCP HTTP ${response.status}`,
         response.status,
       );
     }
@@ -335,6 +349,7 @@ export class McpClient {
         method,
         params,
       }),
+      signal: AbortSignal.timeout(this.timeoutMs),
     });
     this.rememberLegacySession(response);
 

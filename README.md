@@ -80,7 +80,7 @@ This advisor calls neither one.
 TypeScript/Bun:
 
 ```bash
-bun install
+npm ci
 bun run check
 bun test
 ```
@@ -100,6 +100,7 @@ Copy the values you need from `.env.example`:
 ```bash
 export SUWAPPU_API_KEY=suwappu_sk_...
 export WALLET_ADDRESS=0xYourManagedEvmWallet
+export SUWAPPU_OPERATION_TIMEOUT_MS=25000
 ```
 
 `WALLET_ADDRESS` is required for portfolio analysis. `--catalog` does not require either value.
@@ -155,6 +156,23 @@ Keep two scorecards separate:
 
 - **Builder economics:** subscription / usage revenue minus Suwappu credits, model calls, storage, notifications, and support.
 - **Customer portfolio P&L:** an outcome of the customer's assets and decisions. Do not use it as your SaaS revenue or promise it as a return.
+
+## Production operation
+
+The v2 runtime bounds hosted MCP and optional model-provider calls to 30 seconds (`SUWAPPU_OPERATION_TIMEOUT_MS`, 25 seconds by default) and avoids copying raw non-2xx upstream bodies into operator errors. The local allowlist remains the authority boundary; server discovery and MCP annotations never grant a new tool permission.
+
+For multi-tenant operation, keep one credential/environment boundary, rate/budget calls per customer, persist deterministic facts/flags before generated prose, and treat transport timeouts as unknown outcomes even though this particular allowlist is read-only. See [docs/OPERATIONS.md](docs/OPERATIONS.md).
+
+## Develop and release
+
+```bash
+npm ci
+bun run verify
+python -m py_compile advisor.py
+python -m unittest discover -s tests -p 'test_*.py'
+```
+
+CI also builds the non-root container and runs CodeQL. See [CONTRIBUTING.md](CONTRIBUTING.md) and [CHANGELOG.md](CHANGELOG.md).
 
 ## Package/version boundary
 
